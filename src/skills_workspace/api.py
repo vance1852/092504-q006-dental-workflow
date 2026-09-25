@@ -9,11 +9,23 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .errors import DomainError, ValidationError
-from .service import DomainService
+from .ledger import LedgerService
+from .models import WriteReceipt
 from .storage import Database
 
 
-def route(service: DomainService, method: str, path: str, body: dict[str, Any] | None,
+def _respond(receipt: WriteReceipt) -> tuple[int, dict[str, Any]]:
+    return (200 if receipt.replayed else 201), receipt.__dict__
+
+
+def _query(path: str, field: str, required: bool = True) -> str | None:
+    value = parse_qs(urlparse(path).query).get(field, [None])[0]
+    if required and not value:
+        raise ValidationError(f"{field} 不能为空")
+    return value
+
+
+def route(service: LedgerService, method: str, path: str, body: dict[str, Any] | None,
           headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
     """把一个 HTTP 语义请求分派到领域服务。"""
 
@@ -26,28 +38,57 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             valid, count = service.verify_audit()
             return 200, {"status": "ok", "audit_valid": valid, "audit_events": count}
         if method == "POST" and parsed.path == "/organizations":
-            receipt = service.register_organization(actor_id=actor_id, **body)
-            return 200 if receipt.replayed else 201, receipt.__dict__
+            return _respond(service.register_organization(actor_id=actor_id, **body))
         if method == "POST" and parsed.path == "/actors":
-            receipt = service.register_actor(actor_id=actor_id, **body)
-            return 200 if receipt.replayed else 201, receipt.__dict__
+            return _respond(service.register_actor(actor_id=actor_id, **body))
         if method == "POST" and parsed.path == "/sites":
-            receipt = service.register_site(actor_id=actor_id, **body)
-            return 200 if receipt.replayed else 201, receipt.__dict__
+            return _respond(service.register_site(actor_id=actor_id, **body))
         if method == "POST" and parsed.path == "/domain-records":
-            receipt = service.record_domain_data(actor_id=actor_id, **body)
-            return 200 if receipt.replayed else 201, receipt.__dict__
+            return _respond(service.record_domain_data(actor_id=actor_id, **body))
         if method == "GET" and parsed.path == "/domain-records":
-            query = parse_qs(parsed.query)
-            site_id = query.get("site_id", [""])[0]
-            if not site_id:
-                raise ValidationError("site_id 不能为空")
-            category = query.get("category", [None])[0]
-            return 200, {"items": [item.__dict__ for item in service.list_domain_data(site_id, category)]}
+            site_id = _query(path, "site_id")
+            category = _query(path, "category", required=False)
+            return 200, {"items": [item.__dict__ for item in
+                                   service.list_domain_data(site_id, category)]}
         if method == "GET" and parsed.path == "/audit-events":
-            query = parse_qs(parsed.query)
-            after = int(query.get("after_sequence", ["0"])[0])
+            after = int(_query(path, "after_sequence", required=False) or 0)
             return 200, {"items": service.audit_events(after)}
+        if method == "POST" and parsed.path == "/cases":
+            return _respond(service.register_case(actor_id=actor_id, **body))
+        if method == "POST" and parsed.path == "/prescription-versions":
+            return _respond(service.register_prescription_version(actor_id=actor_id, **body))
+        if method == "POST" and parsed.path == "/routes":
+            return _respond(service.create_route(actor_id=actor_id, **body))
+        if method == "POST" and parsed.path == "/steps/start":
+            return _respond(service.start_step(actor_id=actor_id, **body))
+        if method == "POST" and parsed.path == "/steps/complete":
+            return _respond(service.complete_step(actor_id=actor_id, **body))
+        if method == "POST" and parsed.path == "/handovers":
+            return _respond(service.initiate_handover(actor_id=actor_id, **body))
+        if method == "POST" and parsed.path == "/handovers/confirm":
+            return _respond(service.confirm_handover(actor_id=actor_id, **body))
+        if method == "POST" and parsed.path == "/handovers/discrepancies":
+            return _respond(service.raise_discrepancy(actor_id=actor_id, **body))
+        if method == "POST" and parsed.path == "/discrepancies/resolve":
+            return _respond(service.resolve_discrepancy(actor_id=actor_id, **body))
+        if method == "POST" and parsed.path == "/material-batches":
+            return _respond(service.register_material_batch(actor_id=actor_id, **body))
+        if method == "POST" and parsed.path == "/material-batches/split":
+            return _respond(service.split_material_batch(actor_id=actor_id, **body))
+        if method == "POST" and parsed.path == "/material-consumptions":
+            return _respond(service.consume_material(actor_id=actor_id, **body))
+        if method == "GET" and parsed.path == "/products/trace":
+            return 200, service.trace_product(actor_id=actor_id,
+                                              product_id=_query(path, "product_id"))
+        if method == "GET" and parsed.path == "/cases/trace":
+            return 200, service.trace_case(actor_id=actor_id, case_id=_query(path, "case_id"))
+        if method == "GET" and parsed.path == "/materials/trace":
+            return 200, service.trace_material(actor_id=actor_id,
+                                               batch_id=_query(path, "batch_id"))
+        if method == "GET" and parsed.path == "/discrepancies":
+            status = _query(path, "status", required=False) or "open"
+            return 200, {"items": service.list_discrepancies(
+                actor_id=actor_id, site_id=_query(path, "site_id"), status=status)}
         return 404, {"error": "route_not_found", "message": "接口不存在"}
     except DomainError as exc:
         return exc.status, {"error": exc.code, "message": str(exc)}
@@ -58,7 +99,7 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
 class Handler(BaseHTTPRequestHandler):
     """把标准库 HTTP 请求转换为路由调用。"""
 
-    service: DomainService
+    service: LedgerService
 
     def _handle(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -99,7 +140,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
     database = Database(args.database)
-    Handler.service = DomainService(database)
+    Handler.service = LedgerService(database)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()
