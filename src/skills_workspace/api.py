@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -11,6 +12,7 @@ from urllib.parse import parse_qs, urlparse
 from .errors import DomainError, ValidationError
 from .service import DomainService
 from .storage import Database
+from .tracing import TracingService
 
 
 def route(service: DomainService, method: str, path: str, body: dict[str, Any] | None,
@@ -20,6 +22,7 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
     headers = headers or {}
     body = body or {}
     parsed = urlparse(path)
+    segments = [segment for segment in parsed.path.split("/") if segment]
     actor_id = headers.get("X-Actor-Id", "")
     try:
         if method == "GET" and parsed.path == "/health":
@@ -48,11 +51,58 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             query = parse_qs(parsed.query)
             after = int(query.get("after_sequence", ["0"])[0])
             return 200, {"items": service.audit_events(after)}
+
+        status, payload = _route_tracing(service, method, segments, body, actor_id)
+        if status is not None:
+            return status, payload
         return 404, {"error": "route_not_found", "message": "接口不存在"}
     except DomainError as exc:
         return exc.status, {"error": exc.code, "message": str(exc)}
     except (TypeError, ValueError) as exc:
         return 400, {"error": "invalid_request", "message": str(exc)}
+
+
+def _route_tracing(service: DomainService, method: str, segments: list[str],
+                   body: dict[str, Any], actor_id: str) -> tuple[int | None, dict[str, Any]]:
+    """分派病例工序与材料追溯相关路由。"""
+
+    if not isinstance(service, TracingService):
+        return None, {}
+
+    def receipt_result(receipt) -> tuple[int, dict[str, Any]]:
+        return 200 if receipt.replayed else 201, receipt.__dict__
+
+    if method == "POST" and segments == ["cases"]:
+        return receipt_result(service.create_case(actor_id=actor_id, **body))
+    if method == "POST" and len(segments) == 3 and segments[0] == "cases" and segments[2] == "prescription-revisions":
+        return receipt_result(service.revise_prescription(actor_id=actor_id, case_id=segments[1], **body))
+    if method == "POST" and segments == ["operations", "start"]:
+        return receipt_result(service.start_operation(actor_id=actor_id, **body))
+    if method == "POST" and segments == ["handoffs"]:
+        return receipt_result(service.propose_handoff(actor_id=actor_id, **body))
+    if method == "POST" and len(segments) == 3 and segments[0] == "handoffs" and segments[2] == "respond":
+        return receipt_result(service.respond_handoff(actor_id=actor_id, handoff_id=segments[1], **body))
+    if method == "POST" and len(segments) == 3 and segments[0] == "discrepancies" and segments[2] == "resolve":
+        return receipt_result(service.resolve_discrepancy(actor_id=actor_id, discrepancy_id=segments[1], **body))
+    if method == "POST" and segments == ["material-lots"]:
+        return receipt_result(service.register_material_lot(actor_id=actor_id, **body))
+    if method == "POST" and segments == ["materials", "split"]:
+        return receipt_result(service.split_material(actor_id=actor_id, **body))
+    if method == "POST" and segments == ["material-consumptions"]:
+        return receipt_result(service.consume_material(actor_id=actor_id, **body))
+    if method == "POST" and len(segments) == 3 and segments[0] == "products" and segments[2] == "finish":
+        return receipt_result(service.finish_product(actor_id=actor_id, product_id=segments[1], **body))
+    if method == "POST" and len(segments) == 3 and segments[0] == "cases" and segments[2] == "rework":
+        return receipt_result(service.rework(actor_id=actor_id, case_id=segments[1], **body))
+    if method == "POST" and len(segments) == 3 and segments[0] == "cases" and segments[2] == "close":
+        return receipt_result(service.close_case(actor_id=actor_id, case_id=segments[1]))
+    if method == "GET" and len(segments) == 2 and segments[0] == "cases":
+        return 200, dataclasses.asdict(service.get_case_ledger(actor_id=actor_id, case_id=segments[1]))
+    if method == "GET" and len(segments) == 3 and segments[0] == "material-lots" and segments[2] == "balance":
+        return 200, service.material_balance(actor_id=actor_id, lot_id=segments[1])
+    if method == "GET" and len(segments) == 3 and segments[0] == "products" and segments[2] == "trace":
+        return 200, dataclasses.asdict(service.trace_product(actor_id=actor_id, product_id=segments[1]))
+    return None, {}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -99,7 +149,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
     database = Database(args.database)
-    Handler.service = DomainService(database)
+    Handler.service = TracingService(database)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()

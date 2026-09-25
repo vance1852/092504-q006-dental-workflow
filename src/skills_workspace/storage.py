@@ -7,6 +7,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+from .tracing_storage import TRACING_SCHEMA
+
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -76,6 +78,7 @@ class Database:
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA busy_timeout = 5000")
         self.connection.executescript(SCHEMA)
+        self.connection.executescript(TRACING_SCHEMA)
 
     @contextmanager
     def transaction(self, immediate: bool = False) -> Iterator[sqlite3.Connection]:
